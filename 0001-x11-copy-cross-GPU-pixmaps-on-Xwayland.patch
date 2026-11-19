@@ -1,0 +1,112 @@
+From 2c5c98b9b8003189ec45874a4c141fb70992626e Mon Sep 17 00:00:00 2001
+From: mozixun <ronforever@outlook.com>
+Date: Wed, 4 Nov 2026 16:25:09 +0800
+Subject: [PATCH] vulkan/wsi/x11: copy cross-GPU pixmaps on Xwayland
+
+On Xwayland, flipping hands the client's pixmap to the Wayland compositor
+as a wl_buffer, and the explicit-sync release point only comes back once
+the compositor replaces it with a newer commit.  When the client renders
+on a different device than the one the server composites on, that buffer
+also has to be copied across devices before the compositor can use it,
+which pushes the release out: measured on wlroots, 3-4 frames.
+Instrumenting wsi_drm_wait_for_explicit_sync_release() shows it directly -
+for every swapchain image points[RELEASE] == timeline - 1, i.e. none of
+them had been released when the client asked for an image.
+
+A client that keeps a single frame in flight - any GL client, since the
+back buffer is singular - then blocks in vkAcquireNextImageKHR for most of
+a frame with the GPU idle.
+
+Asking the server to copy into its own window pixmap instead releases the
+client's buffer right away.
+
+This is deliberately limited to the cross-GPU case.  When the client is on
+the display GPU the compositor can scan its pixmap out directly, the
+release is prompt, and a copy would only add a full frame of bandwidth:
+forcing it there costs 7-8% at interval=1 on a Radeon 780M.  The two
+cases are told apart by PCI bus id (wsi_x11_check_dri3_compatible()), not
+by device type, so a display wired straight to a discrete GPU is a
+same-GPU case and keeps flipping.
+
+zink on Xwayland, 800x450 @ 165 Hz, 32 fragment-heavy passes,
+interval=1, interleaved runs on an RX 7600M XT rendering for a 780M
+display:
+
+  cross-GPU, flip   82.5 / 83.0 / 82.0 fps
+  cross-GPU, copy   95.0 / 95.0 / 94.0 fps
+
+which puts copy at the interval=0 rate (94-96 fps).
+
+Light load is still clamped to the refresh rate, so this does not
+reintroduce over-production.
+
+Signed-off-by: mozixun <ronforever@outlook.com>
+---
+ src/vulkan/wsi/wsi_common_x11.c | 28 +++++++++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index e33f6263a330..19f8cd47a57f 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -1326,6 +1326,10 @@ struct x11_swapchain {
+ 
+    atomic_int                                   status;
+    bool                                         copy_is_suboptimal;
++   /* The client's device can present on the DRM device the server gave us,
++    * i.e. both sides are the same GPU. See x11_present_to_x11_dri3().
++    */
++   bool                                         same_gpu;
+    struct wsi_queue                             present_queue;
+    struct wsi_queue                             acquire_queue;
+    thrd_t                                       queue_manager;
+@@ -1838,6 +1842,25 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
+        !wsi_device->x11.ignore_suboptimal)
+       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
+ 
++   /* On Xwayland, flipping hands the client's pixmap to the Wayland
++    * compositor as a wl_buffer, and it is only released once the compositor
++    * replaces it with a newer commit. When the client renders on a different
++    * device than the server composites on, that buffer also has to be copied
++    * across devices first, which pushes the release out: measured 3-4 frames,
++    * with every image still unreleased (points[RELEASE] == timeline - 1) when
++    * the client asked for one. A client that keeps a single frame in flight
++    * then blocks in vkAcquireNextImageKHR while the GPU idles.
++    *
++    * Copying into the server's own window pixmap releases the client's buffer
++    * right away. Only do this when the devices differ: when the client is on
++    * the display GPU the compositor can scan the pixmap out directly, the
++    * release is prompt, and a copy would only cost a full frame of bandwidth.
++    * The comparison is by PCI bus id, so a display wired straight to a
++    * discrete GPU is a same-GPU case and keeps flipping.
++    */
++   if (wsi_conn->is_xwayland && !chain->same_gpu)
++      options |= XCB_PRESENT_OPTION_COPY;
++
+    xshmfence_reset(image->shm_fence);
+ 
+    if (!chain->base.image_info.explicit_sync) {
+@@ -3344,6 +3367,8 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ #endif
+    struct wsi_base_image_params *image_params = NULL;
+    struct wsi_cpu_image_params cpu_image_params;
++   /* Assume a single GPU until DRM tells us otherwise. */
++   chain->same_gpu = true;
+    uint64_t *modifiers[2] = {NULL, NULL};
+    if (wsi_device->sw) {
+       cpu_image_params = (struct wsi_cpu_image_params) {
+@@ -3353,9 +3378,10 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+       image_params = &cpu_image_params.base;
+    } else {
+ #ifdef HAVE_X11_DRM
++      chain->same_gpu = wsi_x11_check_dri3_compatible(wsi_device, conn);
+       drm_image_params = (struct wsi_drm_image_params) {
+          .base.image_type = WSI_IMAGE_TYPE_DRM,
+-         .same_gpu = wsi_x11_check_dri3_compatible(wsi_device, conn),
++         .same_gpu = chain->same_gpu,
+          .explicit_sync =
+ #ifdef HAVE_DRI3_EXPLICIT_SYNC
+             wsi_conn->has_dri3_explicit_sync &&
+-- 
+GitLab
+

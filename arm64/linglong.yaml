@@ -1,0 +1,70 @@
+version: "1"
+
+package:
+  id: org.deepin.driver.mesa
+  name: Linyaps Mesa3D Driver Extension
+  version: 25.2.2.25
+  kind: extension
+  architecture: arm64
+  description: |
+    Mesa3D 27.0.0-devel userspace driver extension for Linyaps (OpenGL/EGL/Vulkan)
+  libs: [orig]
+  env:
+    # 让 GLVND 到我们“投递”的目录找 vendor json（与 N 卡写法一致）
+    __EGL_VENDOR_LIBRARY_DIRS: $PREFIX/mesa/share/glvnd/egl_vendor.d
+    __GLX_VENDOR_LIBRARY_NAME: mesa-ext
+
+    # 指定 OpenCL 驱动目录
+    OCL_ICD_VENDORS: $PREFIX/mesa/etc/OpenCL/vendors
+
+    # 指定GBM后端路径
+    GBM_BACKENDS_PATH: $PREFIX/mesa/lib/aarch64-linux-gnu/gbm
+
+    # 指定 VA-API 驱动目录：扩展自带了 radeonsi/nouveau/virtio_gpu/d3d12/zink
+    # 的 *_drv_video.so，不指定的话 libva 会去 /usr/lib/.../dri 找 base 的
+    # Mesa 24.3 那份。后面保留 base 默认路径，Intel 的 iHD_drv_video.so
+    # 来自 intel-media-driver，不在扩展里，不能被挤掉。
+    LIBVA_DRIVERS_PATH: $PREFIX/mesa/lib/aarch64-linux-gnu/dri:/usr/lib/aarch64-linux-gnu/dri
+
+    # 指定 Vulkan 驱动信息文件（ARM64 的 ICD 后缀为 aarch64.json）。
+    # 驱动列表与 build-and-install.sh 的 -Dvulkan-drivers 保持一致。
+    VK_DRIVER_FILES: $PREFIX/mesa/share/vulkan/icd.d/radeon_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/nouveau_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/freedreno_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/intel_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/broadcom_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/panfrost_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/dzn_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/lvp_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/virtio_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/powervr_mesa_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/gfxstream_vk_icd.aarch64.json:$PREFIX/mesa/share/vulkan/icd.d/asahi_icd.aarch64.json
+
+base: org.deepin.base/25.2.2
+
+# 如果你把 Mesa 打包成压缩文件放到 sources/，这里也可以写成 kinds:file 并在 build 里解包
+# sources:
+#   - kind: file
+#     url: file:///project/linglong/sources/mesa-root.tar.zst
+#     name: mesa-root.tar.zst
+
+build: |
+  set -euo pipefail
+  : "${TRIPLET:=aarch64-linux-gnu}"
+
+  # 帮玲珑擦文件冲突的屁股
+  rm -f /etc/motd
+
+  # 先执行构建脚本编译并安装对应内容
+  bash build-and-install.sh
+
+  # 源目录：就是你工程里的 Mesa 文件树（之前 tree 的那个）
+  # SOURCE=./external_sources
+
+  # 6) 把 Mesa 的库路径写到 ld.so.conf（与你 N 卡的做法对齐）
+  # 使用构建环境里的 PREFIX / TRIPLET，避免在 ARM64 配置里写死 x86_64。
+  mkdir -p ${PREFIX}/etc
+  cat > ${PREFIX}/etc/ld.so.conf <<EOF
+  ${PREFIX}/mesa/lib/${TRIPLET}
+  ${PREFIX}/wayland/lib/${TRIPLET}
+  ${PREFIX}/libxcb/lib/${TRIPLET}
+  ${PREFIX}/libdrm/lib/${TRIPLET}
+  ${PREFIX}/llvm-19
+  EOF
+
+  # 在构建环境里刷新下缓存；运行时由容器环境接管
+  ldconfig || true
+
+  # 清理解压的文件夹缓存
+  # rm -rf org.deepin.driver.mesa
+  echo 'build done'
